@@ -141,10 +141,20 @@ def init_active_liquidity_from_ticks(current_tick: int, ticks: Dict[int, TickInf
     return max(total, 0)
 
 
+class FeeAccrualValidator:
+    def __init__(self, tick_lower: int, tick_upper: int, liquidity_L: int):
+        self.tick_lower = tick_lower
+        self.tick_upper = tick_upper
+        self.L = int(liquidity_L)
+        self.accr_token0: int = 0
+        self.accr_token1: int = 0
+
+
 def simulate_swaps(swaps: pd.DataFrame,
                    pool_fee_bps: int,
                    init_state: PoolState,
-                   ticks: Dict[int, TickInfo]) -> Tuple[PoolState, Dict[int, TickInfo]]:
+                   ticks: Dict[int, TickInfo],
+                   validator: FeeAccrualValidator | None = None) -> Tuple[PoolState, Dict[int, TickInfo]]:
     state = PoolState(
         sqrt_price_x96=init_state.sqrt_price_x96,
         tick=init_state.tick,
@@ -195,6 +205,17 @@ def simulate_swaps(swaps: pd.DataFrame,
                 lp_fee, _ = apply_protocol_fee(fee_amount, state.fee_protocol_token1)
                 if state.liquidity_active > 0 and lp_fee > 0:
                     state.fee_growth_global1_x128 += (lp_fee * Q128) // state.liquidity_active
+
+            # Optional: direct accrual validator using pro-rata share L/L_active when in range
+            if validator is not None and state.liquidity_active > 0 and lp_fee > 0:
+                in_range = (validator.tick_lower <= state.tick < validator.tick_upper)
+                if in_range and validator.L > 0:
+                    share_num = validator.L * lp_fee
+                    share = share_num // state.liquidity_active
+                    if input_token == 0:
+                        validator.accr_token0 += share
+                    else:
+                        validator.accr_token1 += share
 
             state.sqrt_price_x96 = step_target
             if state.sqrt_price_x96 == next_sqrt:
@@ -271,6 +292,47 @@ def compute_L_from_deposit(price_lower: Decimal, price_upper: Decimal, price_cur
     return L, int(amt0), int(amt1)
 
 
+def compute_L_for_budget_usd(price_lower: Decimal, price_upper: Decimal, price_current: Decimal,
+                             total_usd: Decimal, decimals0: int, decimals1: int) -> Tuple[int, int, int]:
+    # Convert to raw sqrt prices
+    raw_lower = price_lower * (Decimal(10) ** Decimal(decimals1 - decimals0))
+    raw_upper = price_upper * (Decimal(10) ** Decimal(decimals1 - decimals0))
+    raw_current = price_current * (Decimal(10) ** Decimal(decimals1 - decimals0))
+    a = int((raw_lower.sqrt() * Q96).to_integral_value(rounding='ROUND_FLOOR'))
+    b = int((raw_upper.sqrt() * Q96).to_integral_value(rounding='ROUND_FLOOR'))
+    p = int((raw_current.sqrt() * Q96).to_integral_value(rounding='ROUND_FLOOR'))
+
+    # Value conversion: token0 minimal units * raw_current => token1 minimal units (USD cents)
+
+    if p <= a:
+        # Pure token0 deposit: USD per unit L
+        num = (b - a) << 96
+        denom = b * a
+        amt0_per_L = Decimal(num) / Decimal(denom)
+        k = raw_current * amt0_per_L
+    elif p >= b:
+        # Pure token1 deposit
+        amt1_per_L = Decimal(b - a) / Decimal(Q96)
+        k = amt1_per_L
+    else:
+        # Mixed region
+        amt0_per_L = Decimal(((b - p) << 96)) / Decimal(b * p)
+        amt1_per_L = Decimal(p - a) / Decimal(Q96)
+        k = amt1_per_L + raw_current * amt0_per_L
+
+    # Convert USD budget to token1 minimal units (USDT has decimals1)
+    total_usd_units = total_usd * (Decimal(10) ** Decimal(decimals1))
+    if k == 0:
+        L = 0
+    else:
+        L = int((total_usd_units / k).to_integral_value(rounding='ROUND_FLOOR'))
+
+    # Compute final amounts with integer functions
+    amt0 = get_amount0_delta(p if p < b else a, b, L, round_up=True) if p < b else 0
+    amt1 = get_amount1_delta(a, p if p > a else b, L, round_up=True) if p > a else 0
+    return L, int(amt0), int(amt1)
+
+
 def load_pool_context(base: Path) -> Tuple[PoolConfig, PoolState]:
     pool_cfg = pd.read_csv(base / 'dune_pipeline' / 'pool_config_eth_usdt_0p3.csv')
     tokens = pd.read_csv(base / 'dune_pipeline' / 'token_metadata_eth_usdt_0p3.csv')
@@ -318,7 +380,9 @@ def main():
     parser.add_argument('--price-upper', type=float, required=True, help='Upper price (token1 per token0)')
     parser.add_argument('--start', type=str, required=True, help='Start time (ISO, UTC)')
     parser.add_argument('--end', type=str, required=True, help='End time (ISO, UTC)')
-    parser.add_argument('--liquidity', type=int, default=None, help='Optional liquidity units (default 1e18)')
+    parser.add_argument('--liquidity', type=int, default=None, help='Optional liquidity units (overrides USD budget)')
+    parser.add_argument('--total-usd', type=float, default=None, help='Total USD budget to deposit (token1 is USD for ETH/USDT)')
+    parser.add_argument('--validate', action='store_true', help='Enable fee accrual validation via direct pro-rata accounting')
     args = parser.parse_args()
 
     base = Path('/home/poon/developments/ice-senior-project')
@@ -341,9 +405,8 @@ def main():
     global1_start = init.fee_growth_global1_x128
     tick_start = init.tick
 
-    # Run simulation
-    final_state, tick_map_out = simulate_swaps(swaps_w, cfg.fee, init, tick_map)
-
+    # Optional validator
+    validator = None
     # Prepare range
     lower_px = Decimal(str(args.price_lower))
     upper_px = Decimal(str(args.price_upper))
@@ -351,16 +414,13 @@ def main():
     upper_tick = round_tick_to_spacing(price_to_tick(upper_px, cfg.decimals0, cfg.decimals1), cfg.tick_spacing)
     if lower_tick >= upper_tick:
         raise ValueError('lower_tick must be < upper_tick')
-
     # Compute deposit from range at start price
     start_price = sqrt_price_x96_to_price(init.sqrt_price_x96, cfg.decimals0, cfg.decimals1)
-    L, amount0, amount1 = compute_L_from_deposit(lower_px, upper_px, start_price,
-                                                 amount0=None if args.liquidity is not None else None,
-                                                 amount1=None if args.liquidity is not None else None,
-                                                 decimals0=cfg.decimals0, decimals1=cfg.decimals1)
     if args.liquidity is not None:
+        L, amount0, amount1 = compute_L_from_deposit(lower_px, upper_px, start_price,
+                                                     amount0=None, amount1=None,
+                                                     decimals0=cfg.decimals0, decimals1=cfg.decimals1)
         L = int(args.liquidity)
-        # recompute amounts for this L
         a = Decimal(args.price_lower) * (Decimal(10) ** Decimal(cfg.decimals1 - cfg.decimals0))
         b = Decimal(args.price_upper) * (Decimal(10) ** Decimal(cfg.decimals1 - cfg.decimals0))
         p = start_price * (Decimal(10) ** Decimal(cfg.decimals1 - cfg.decimals0))
@@ -369,6 +429,18 @@ def main():
         sqrt_p = int((p.sqrt() * Q96).to_integral_value(rounding='ROUND_FLOOR'))
         amount0 = get_amount0_delta(sqrt_p if sqrt_p < sqrt_b else sqrt_a, sqrt_b, L, round_up=True) if sqrt_p < sqrt_b else 0
         amount1 = get_amount1_delta(sqrt_a, sqrt_p if sqrt_p > sqrt_a else sqrt_b, L, round_up=True) if sqrt_p > sqrt_a else 0
+    else:
+        if args.total_usd is None:
+            raise SystemExit('Either --liquidity or --total-usd must be provided')
+        L, amount0, amount1 = compute_L_for_budget_usd(lower_px, upper_px, start_price,
+                                                       Decimal(str(args.total_usd)),
+                                                       cfg.decimals0, cfg.decimals1)
+    if args.validate:
+        validator = FeeAccrualValidator(lower_tick, upper_tick, L)
+    # Run simulation
+    final_state, tick_map_out = simulate_swaps(swaps_w, cfg.fee, init, tick_map, validator)
+
+    
 
     # Fee growth inside delta over [t0, t1]
     d0, d1 = fee_growth_inside_delta(
@@ -394,6 +466,10 @@ def main():
     print({'fees_token0_wei': int(fees0), 'fees_token1_wei': int(fees1)})
     print({'fees_token0_eth': float(Decimal(fees0) / Decimal(10 ** cfg.decimals0)),
            'fees_token1_eth': float(Decimal(fees1) / Decimal(10 ** cfg.decimals1))})
+
+    if args.validate and validator is not None:
+        print({'validation_direct_pro_rata_token0_wei': validator.accr_token0,
+               'validation_direct_pro_rata_token1_wei': validator.accr_token1})
 
 
 if __name__ == '__main__':
