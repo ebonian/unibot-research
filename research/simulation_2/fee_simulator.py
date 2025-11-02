@@ -69,7 +69,7 @@ def price_to_tick(price_token1_per_token0: Decimal, decimals0: int, decimals1: i
         raise ValueError('price must be positive')
     # Convert to raw ratio before tick mapping
     price_raw = price_token1_per_token0 * (Decimal(10) ** Decimal(decimals1 - decimals0))
-    return int((price_raw.ln() / Decimal('1.0001').ln()).to_integral_value(rounding='ROUND_HALF_EVEN'))
+    return int((price_raw.ln() / Decimal('1.0001').ln()).to_integral_value(rounding='ROUND_FLOOR'))
 
 
 def round_tick_to_spacing(tick: int, spacing: int) -> int:
@@ -158,7 +158,8 @@ def simulate_swaps(swaps: pd.DataFrame,
                    ticks: Dict[int, TickInfo],
                    validator: FeeAccrualValidator | None = None,
                    mints_post: pd.DataFrame | None = None,
-                   burns_post: pd.DataFrame | None = None) -> Tuple[PoolState, Dict[int, TickInfo]]:
+                   burns_post: pd.DataFrame | None = None,
+                   use_swap_liquidity: bool = False) -> Tuple[PoolState, Dict[int, TickInfo]]:
     state = PoolState(
         sqrt_price_x96=init_state.sqrt_price_x96,
         tick=init_state.tick,
@@ -228,7 +229,7 @@ def simulate_swaps(swaps: pd.DataFrame,
                     info_u.liquidity_net -= Lchg
                     info_u.initialized = True
 
-                    if tl <= state.tick < tu:
+                    if (not use_swap_liquidity) and (tl <= state.tick < tu):
                         state.liquidity_active += Lchg
                     mi += 1
                     did_one = True
@@ -250,7 +251,7 @@ def simulate_swaps(swaps: pd.DataFrame,
                         ticks[tu] = info_u
                     info_u.liquidity_net += Lchg
 
-                    if tl <= state.tick < tu:
+                    if (not use_swap_liquidity) and (tl <= state.tick < tu):
                         state.liquidity_active = max(0, state.liquidity_active - Lchg)
                     bi += 1
                     did_one = True
@@ -261,6 +262,10 @@ def simulate_swaps(swaps: pd.DataFrame,
         target_tick = int(s['tick'])
         amt0 = int(s['amount0'])
         amt1 = int(s['amount1'])
+        # Choose active liquidity basis
+        swap_L = int(s['liquidity']) if 'liquidity' in s and pd.notna(s['liquidity']) else state.liquidity_active
+        if use_swap_liquidity:
+            state.liquidity_active = int(swap_L)
         if amt0 == 0 and amt1 == 0:
             continue
         if amt0 > 0 and amt1 < 0:
@@ -274,35 +279,36 @@ def simulate_swaps(swaps: pd.DataFrame,
             input_token = 0 if zero_for_one else 1
 
         while state.sqrt_price_x96 != target_sqrt:
+            active_L = int(swap_L) if use_swap_liquidity else state.liquidity_active
             if zero_for_one:
                 next_tick = state.tick - 1
                 next_sqrt = tick_to_sqrt_price_x96(next_tick)
                 step_target = max(next_sqrt, target_sqrt)
-                in_net = get_amount0_delta(step_target, state.sqrt_price_x96, state.liquidity_active, round_up=True)
+                in_net = get_amount0_delta(step_target, state.sqrt_price_x96, active_L, round_up=True)
             else:
                 next_tick = state.tick + 1
                 next_sqrt = tick_to_sqrt_price_x96(next_tick)
                 step_target = min(next_sqrt, target_sqrt)
-                in_net = get_amount1_delta(state.sqrt_price_x96, step_target, state.liquidity_active, round_up=True)
+                in_net = get_amount1_delta(state.sqrt_price_x96, step_target, active_L, round_up=True)
 
             gross_in = (in_net * FEE_DENOM + (FEE_DENOM - pool_fee_bps) - 1) // (FEE_DENOM - pool_fee_bps)
             fee_amount = gross_in - in_net
 
             if input_token == 0:
                 lp_fee, _ = apply_protocol_fee(fee_amount, state.fee_protocol_token0)
-                if state.liquidity_active > 0 and lp_fee > 0:
-                    state.fee_growth_global0_x128 += (lp_fee * Q128) // state.liquidity_active
+                if active_L > 0 and lp_fee > 0:
+                    state.fee_growth_global0_x128 += (lp_fee * Q128) // active_L
             else:
                 lp_fee, _ = apply_protocol_fee(fee_amount, state.fee_protocol_token1)
-                if state.liquidity_active > 0 and lp_fee > 0:
-                    state.fee_growth_global1_x128 += (lp_fee * Q128) // state.liquidity_active
+                if active_L > 0 and lp_fee > 0:
+                    state.fee_growth_global1_x128 += (lp_fee * Q128) // active_L
 
             # Optional: direct accrual validator using pro-rata share L/L_active when in range
-            if validator is not None and state.liquidity_active > 0 and lp_fee > 0:
+            if validator is not None and active_L > 0 and lp_fee > 0:
                 in_range = (validator.tick_lower <= state.tick < validator.tick_upper)
                 if in_range and validator.L > 0:
                     share_num = validator.L * lp_fee
-                    share = share_num // state.liquidity_active
+                    share = share_num // active_L
                     if input_token == 0:
                         validator.accr_token0 += share
                     else:
@@ -316,10 +322,11 @@ def simulate_swaps(swaps: pd.DataFrame,
                     ticks[next_tick] = info
                 info.fee_growth_outside0_x128 = state.fee_growth_global0_x128
                 info.fee_growth_outside1_x128 = state.fee_growth_global1_x128
-                if zero_for_one:
-                    state.liquidity_active -= info.liquidity_net
-                else:
-                    state.liquidity_active += info.liquidity_net
+                if not use_swap_liquidity:
+                    if zero_for_one:
+                        state.liquidity_active -= info.liquidity_net
+                    else:
+                        state.liquidity_active += info.liquidity_net
                 state.tick = next_tick
             else:
                 state.tick = target_tick
@@ -493,6 +500,8 @@ def main():
     parser.add_argument('--liquidity', type=int, default=None, help='Optional liquidity units (overrides USD budget)')
     parser.add_argument('--total-usd', type=float, default=None, help='Total USD budget to deposit (token1 is USD for ETH/USDT)')
     parser.add_argument('--validate', action='store_true', help='Enable fee accrual validation via direct pro-rata accounting')
+    parser.add_argument('--use-swap-liquidity', action='store_true', help='Use per-swap pool liquidity for fee growth (approximation when full tick snapshot is unavailable)')
+    parser.add_argument('--accounting-mode', choices=['growth', 'direct'], default='growth', help='Compute fees from feeGrowthInside (growth) or direct pro-rata integral (direct)')
     args = parser.parse_args()
 
     base = Path('/home/poon/developments/ice-senior-project')
@@ -503,6 +512,7 @@ def main():
     t0 = pd.to_datetime(args.start, utc=True)
     t1 = pd.to_datetime(args.end, utc=True)
     swaps_w = swaps[(swaps['evt_block_time'] >= t0) & (swaps['evt_block_time'] <= t1)].copy()
+    swaps_w = swaps_w.sort_values(['evt_block_time', 'evt_block_number']).reset_index(drop=True)
     # Build initial tick map from events up to t0
     mints_before = mints[(mints['evt_block_time'] <= t0)].copy()
     burns_before = burns[(burns['evt_block_time'] <= t0)].copy()
@@ -514,7 +524,15 @@ def main():
 
     # Build tick map to t1 (best we can without a genesis snapshot)
     tick_map = build_liquidity_net_from_events(mints_before, burns_before)
-    init.liquidity_active = init_active_liquidity_from_ticks(init.tick, tick_map)
+    if args.use_swap_liquidity:
+        if len(swaps_w) == 0:
+            raise SystemExit('No swaps in selected window to infer liquidity; remove --use-swap-liquidity or widen the window')
+        try:
+            init.liquidity_active = int(swaps_w.iloc[0]['liquidity'])
+        except Exception:
+            raise SystemExit('Swaps dataset missing liquidity column; cannot use --use-swap-liquidity')
+    else:
+        init.liquidity_active = init_active_liquidity_from_ticks(init.tick, tick_map)
 
     # Capture start snapshot
     global0_start = init.fee_growth_global0_x128
@@ -558,7 +576,7 @@ def main():
         L, amount0, amount1 = compute_L_for_budget_usd(lower_px, upper_px, start_price,
                                                        Decimal(str(args.total_usd)),
                                                        cfg.decimals0, cfg.decimals1)
-    if args.validate:
+    if args.validate or args.accounting_mode == 'direct':
         validator = FeeAccrualValidator(lower_tick, upper_tick, L)
     # Initialize feeGrowthOutside for user's chosen ticks at start (hypothetical mint at t0)
     ls = tick_map_start.get(lower_tick)
@@ -578,7 +596,7 @@ def main():
     us.initialized = True
 
     # Run simulation
-    final_state, tick_map_out = simulate_swaps(swaps_w, cfg.fee, init, tick_map, validator, mints_post, burns_post)
+    final_state, tick_map_out = simulate_swaps(swaps_w, cfg.fee, init, tick_map, validator, mints_post, burns_post, use_swap_liquidity=args.use_swap_liquidity)
 
     
 
@@ -611,8 +629,14 @@ def main():
         tick_start,
         final_state.tick,
     )
-    fees0 = (L * d0) // Q128
-    fees1 = (L * d1) // Q128
+    if args.accounting_mode == 'direct':
+        if validator is None:
+            raise SystemExit('Direct accounting mode requires validator')
+        fees0 = int(validator.accr_token0)
+        fees1 = int(validator.accr_token1)
+    else:
+        fees0 = (L * d0) // Q128
+        fees1 = (L * d1) // Q128
 
     print({'pool': cfg.pool,
            'start_tick': tick_start,
