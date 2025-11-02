@@ -105,8 +105,10 @@ def get_amount1_delta(sqrt_pa_x96: int, sqrt_pb_x96: int, liquidity: int, round_
 def apply_protocol_fee(fee_amount: int, proto_b4: int) -> Tuple[int, int]:
     if proto_b4 == 0:
         return fee_amount, 0
-    lp = (fee_amount * (256 - proto_b4)) // 256
-    return lp, fee_amount - lp
+    # Core semantics: protocol takes 1 / proto_b4 of fees
+    protocol_cut = fee_amount // proto_b4
+    lp_fee = fee_amount - protocol_cut
+    return lp_fee, protocol_cut
 
 
 def build_liquidity_net_from_events(mints: pd.DataFrame, burns: pd.DataFrame) -> Dict[int, TickInfo]:
@@ -154,7 +156,9 @@ def simulate_swaps(swaps: pd.DataFrame,
                    pool_fee_bps: int,
                    init_state: PoolState,
                    ticks: Dict[int, TickInfo],
-                   validator: FeeAccrualValidator | None = None) -> Tuple[PoolState, Dict[int, TickInfo]]:
+                   validator: FeeAccrualValidator | None = None,
+                   mints_post: pd.DataFrame | None = None,
+                   burns_post: pd.DataFrame | None = None) -> Tuple[PoolState, Dict[int, TickInfo]]:
     state = PoolState(
         sqrt_price_x96=init_state.sqrt_price_x96,
         tick=init_state.tick,
@@ -165,7 +169,94 @@ def simulate_swaps(swaps: pd.DataFrame,
         fee_growth_global1_x128=init_state.fee_growth_global1_x128,
     )
 
+    mi = 0
+    bi = 0
+    mlen = len(mints_post) if mints_post is not None else 0
+    blen = len(burns_post) if burns_post is not None else 0
+
     for _, s in swaps.iterrows():
+        # Process all mints/burns up to this swap (by time, then block number)
+        if mints_post is not None or burns_post is not None:
+            swap_time = s['evt_block_time']
+            swap_bn = int(s['evt_block_number'])
+
+            while True:
+                did_one = False
+                # choose next event among mint/burn with earliest (time, block)
+                next_m = None
+                next_b = None
+                if mints_post is not None and mi < mlen:
+                    rm = mints_post.iloc[mi]
+                    next_m = (rm['evt_block_time'], int(rm['evt_block_number']), 'mint', rm)
+                if burns_post is not None and bi < blen:
+                    rb = burns_post.iloc[bi]
+                    next_b = (rb['evt_block_time'], int(rb['evt_block_number']), 'burn', rb)
+                nxt = None
+                if next_m is not None and (next_b is None or (next_m[0], next_m[1]) <= (next_b[0], next_b[1])):
+                    nxt = next_m
+                elif next_b is not None:
+                    nxt = next_b
+
+                if nxt is None:
+                    break
+
+                n_time, n_bn, ev_type, row = nxt
+                if (n_time, n_bn) >= (swap_time, swap_bn):
+                    break
+
+                tl = int(row['tickLower'])
+                tu = int(row['tickUpper'])
+                if ev_type == 'mint':
+                    Lchg = int(row['liquidity_added'])
+                    # update tick liquidity nets
+                    info_l = ticks.get(tl)
+                    if info_l is None:
+                        info_l = TickInfo(liquidity_net=0, initialized=True)
+                        # initialize outside with current globals
+                        info_l.fee_growth_outside0_x128 = state.fee_growth_global0_x128
+                        info_l.fee_growth_outside1_x128 = state.fee_growth_global1_x128
+                        ticks[tl] = info_l
+                    info_l.liquidity_net += Lchg
+                    info_l.initialized = True
+
+                    info_u = ticks.get(tu)
+                    if info_u is None:
+                        info_u = TickInfo(liquidity_net=0, initialized=True)
+                        info_u.fee_growth_outside0_x128 = state.fee_growth_global0_x128
+                        info_u.fee_growth_outside1_x128 = state.fee_growth_global1_x128
+                        ticks[tu] = info_u
+                    info_u.liquidity_net -= Lchg
+                    info_u.initialized = True
+
+                    if tl <= state.tick < tu:
+                        state.liquidity_active += Lchg
+                    mi += 1
+                    did_one = True
+                else:
+                    Lchg = int(row['liquidity_removed'])
+                    info_l = ticks.get(tl)
+                    if info_l is None:
+                        info_l = TickInfo(liquidity_net=0, initialized=True)
+                        info_l.fee_growth_outside0_x128 = state.fee_growth_global0_x128
+                        info_l.fee_growth_outside1_x128 = state.fee_growth_global1_x128
+                        ticks[tl] = info_l
+                    info_l.liquidity_net -= Lchg
+
+                    info_u = ticks.get(tu)
+                    if info_u is None:
+                        info_u = TickInfo(liquidity_net=0, initialized=True)
+                        info_u.fee_growth_outside0_x128 = state.fee_growth_global0_x128
+                        info_u.fee_growth_outside1_x128 = state.fee_growth_global1_x128
+                        ticks[tu] = info_u
+                    info_u.liquidity_net += Lchg
+
+                    if tl <= state.tick < tu:
+                        state.liquidity_active = max(0, state.liquidity_active - Lchg)
+                    bi += 1
+                    did_one = True
+
+                if not did_one:
+                    break
         target_sqrt = int(s['sqrtPriceX96'])
         target_tick = int(s['tick'])
         amt0 = int(s['amount0'])
@@ -236,35 +327,54 @@ def simulate_swaps(swaps: pd.DataFrame,
     return state, ticks
 
 
-def fee_growth_inside_delta(ticks: Dict[int, TickInfo],
-                            tick_lower: int,
-                            tick_upper: int,
-                            global0_x128_start: int,
-                            global1_x128_start: int,
-                            global0_x128_end: int,
-                            global1_x128_end: int,
-                            tick_at_start: int,
-                            tick_at_end: int) -> Tuple[int, int]:
-    lower = ticks.get(tick_lower, TickInfo(0, 0, 0, False))
-    upper = ticks.get(tick_upper, TickInfo(0, 0, 0, False))
+def fee_growth_inside_delta(
+    ticks_start: Dict[int, TickInfo],
+    ticks_end: Dict[int, TickInfo],
+    tick_lower: int,
+    tick_upper: int,
+    global0_x128_start: int,
+    global1_x128_start: int,
+    global0_x128_end: int,
+    global1_x128_end: int,
+    tick_at_start: int,
+    tick_at_end: int,
+) -> Tuple[int, int]:
+    lower_start = ticks_start.get(tick_lower, TickInfo(0, 0, 0, False))
+    upper_start = ticks_start.get(tick_upper, TickInfo(0, 0, 0, False))
+    lower_end = ticks_end.get(tick_lower, TickInfo(0, 0, 0, False))
+    upper_end = ticks_end.get(tick_upper, TickInfo(0, 0, 0, False))
 
-    def inside(global_start, global_end, lower_out, upper_out, tick_start, tick_end):
-        below_start = lower_out if tick_start >= tick_lower else global_start - lower_out
-        above_start = upper_out if tick_start < tick_upper else global_start - upper_out
-        inside_start = global_start - below_start - above_start
+    def inside(global_val, lower_out, upper_out, tick_current):
+        below = lower_out if tick_current >= tick_lower else global_val - lower_out
+        above = upper_out if tick_current < tick_upper else global_val - upper_out
+        return global_val - below - above
 
-        below_end = lower_out if tick_end >= tick_lower else global_end - lower_out
-        above_end = upper_out if tick_end < tick_upper else global_end - upper_out
-        inside_end = global_end - below_end - above_end
-        return inside_end - inside_start
+    inside0_start = inside(
+        global0_x128_start,
+        lower_start.fee_growth_outside0_x128,
+        upper_start.fee_growth_outside0_x128,
+        tick_at_start,
+    )
+    inside0_end = inside(
+        global0_x128_end,
+        lower_end.fee_growth_outside0_x128,
+        upper_end.fee_growth_outside0_x128,
+        tick_at_end,
+    )
+    inside1_start = inside(
+        global1_x128_start,
+        lower_start.fee_growth_outside1_x128,
+        upper_start.fee_growth_outside1_x128,
+        tick_at_start,
+    )
+    inside1_end = inside(
+        global1_x128_end,
+        lower_end.fee_growth_outside1_x128,
+        upper_end.fee_growth_outside1_x128,
+        tick_at_end,
+    )
 
-    d0 = inside(global0_x128_start, global0_x128_end,
-                lower.fee_growth_outside0_x128, upper.fee_growth_outside0_x128,
-                tick_at_start, tick_at_end)
-    d1 = inside(global1_x128_start, global1_x128_end,
-                lower.fee_growth_outside1_x128, upper.fee_growth_outside1_x128,
-                tick_at_start, tick_at_end)
-    return d0, d1
+    return inside0_end - inside0_start, inside1_end - inside1_start
 
 
 def compute_L_from_deposit(price_lower: Decimal, price_upper: Decimal, price_current: Decimal,
@@ -393,17 +503,30 @@ def main():
     t0 = pd.to_datetime(args.start, utc=True)
     t1 = pd.to_datetime(args.end, utc=True)
     swaps_w = swaps[(swaps['evt_block_time'] >= t0) & (swaps['evt_block_time'] <= t1)].copy()
-    mints_w = mints[(mints['evt_block_time'] <= t1)].copy()
-    burns_w = burns[(burns['evt_block_time'] <= t1)].copy()
+    # Build initial tick map from events up to t0
+    mints_before = mints[(mints['evt_block_time'] <= t0)].copy()
+    burns_before = burns[(burns['evt_block_time'] <= t0)].copy()
+    # Post-start events to interleave with swaps
+    mints_post = mints[(mints['evt_block_time'] > t0) & (mints['evt_block_time'] <= t1)].copy()
+    burns_post = burns[(burns['evt_block_time'] > t0) & (burns['evt_block_time'] <= t1)].copy()
+    mints_post = mints_post.sort_values(['evt_block_time', 'evt_block_number']).reset_index(drop=True)
+    burns_post = burns_post.sort_values(['evt_block_time', 'evt_block_number']).reset_index(drop=True)
 
     # Build tick map to t1 (best we can without a genesis snapshot)
-    tick_map = build_liquidity_net_from_events(mints_w, burns_w)
+    tick_map = build_liquidity_net_from_events(mints_before, burns_before)
     init.liquidity_active = init_active_liquidity_from_ticks(init.tick, tick_map)
 
     # Capture start snapshot
     global0_start = init.fee_growth_global0_x128
     global1_start = init.fee_growth_global1_x128
     tick_start = init.tick
+
+    # Snapshot ticks at start for accurate inside-growth delta
+    tick_map_start = {t: TickInfo(info.liquidity_net,
+                                  info.fee_growth_outside0_x128,
+                                  info.fee_growth_outside1_x128,
+                                  info.initialized)
+                      for t, info in tick_map.items()}
 
     # Optional validator
     validator = None
@@ -437,13 +560,47 @@ def main():
                                                        cfg.decimals0, cfg.decimals1)
     if args.validate:
         validator = FeeAccrualValidator(lower_tick, upper_tick, L)
+    # Initialize feeGrowthOutside for user's chosen ticks at start (hypothetical mint at t0)
+    ls = tick_map_start.get(lower_tick)
+    if ls is None:
+        ls = TickInfo(liquidity_net=0, initialized=True)
+        tick_map_start[lower_tick] = ls
+    ls.fee_growth_outside0_x128 = global0_start
+    ls.fee_growth_outside1_x128 = global1_start
+    ls.initialized = True
+
+    us = tick_map_start.get(upper_tick)
+    if us is None:
+        us = TickInfo(liquidity_net=0, initialized=True)
+        tick_map_start[upper_tick] = us
+    us.fee_growth_outside0_x128 = global0_start
+    us.fee_growth_outside1_x128 = global1_start
+    us.initialized = True
+
     # Run simulation
-    final_state, tick_map_out = simulate_swaps(swaps_w, cfg.fee, init, tick_map, validator)
+    final_state, tick_map_out = simulate_swaps(swaps_w, cfg.fee, init, tick_map, validator, mints_post, burns_post)
 
     
 
     # Fee growth inside delta over [t0, t1]
+    # Ensure end snapshot contains user's ticks (if never crossed during simulation)
+    if lower_tick not in tick_map_out:
+        tick_map_out[lower_tick] = TickInfo(
+            liquidity_net=tick_map_start[lower_tick].liquidity_net,
+            fee_growth_outside0_x128=tick_map_start[lower_tick].fee_growth_outside0_x128,
+            fee_growth_outside1_x128=tick_map_start[lower_tick].fee_growth_outside1_x128,
+            initialized=True,
+        )
+    if upper_tick not in tick_map_out:
+        tick_map_out[upper_tick] = TickInfo(
+            liquidity_net=tick_map_start[upper_tick].liquidity_net,
+            fee_growth_outside0_x128=tick_map_start[upper_tick].fee_growth_outside0_x128,
+            fee_growth_outside1_x128=tick_map_start[upper_tick].fee_growth_outside1_x128,
+            initialized=True,
+        )
+
     d0, d1 = fee_growth_inside_delta(
+        tick_map_start,
         tick_map_out,
         lower_tick,
         upper_tick,
