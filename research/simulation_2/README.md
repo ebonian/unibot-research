@@ -65,6 +65,7 @@ Note: Only use growth mode if you have populated all tick states at t0 (see Data
 
 ### Implementation notes
 
+- Initialization at t0: seeds `sqrtPriceX96`/`tick` from the last swap strictly before `t0` if available; otherwise from the latest `slot0` snapshot at or before `t0`. `feeProtocol` is sampled from the same `slot0` basis.
 - Tick mapping: price-to-tick rounds down (floor) and ticks are rounded to tick spacing.
 - Fees are charged on the input token per swap, net LP fees are pro‑rated by active liquidity.
 - Protocol fees (if any) are accounted for before LP distribution.
@@ -72,12 +73,55 @@ Note: Only use growth mode if you have populated all tick states at t0 (see Data
 
 ### Outputs
 
-The simulator prints:
+The simulator prints a JSON summary with these fields (human units):
 
-- Pool and ticks crossed
-- Deposit liquidity and token amounts
-- Fees in token0/token1 minimal units and human units
-- (With `--validate`) direct accounting totals for cross‑checking
+- pool: pool address
+- fee_bps: pool fee in hundredths of a bip
+- tokens:
+  - token0: { address, symbol, decimals }
+  - token1: { address, symbol, decimals }
+- window_utc: { start, end }
+- position_ticks: { lower, upper } – tick indices used for the position
+- price: { start, end } – token1 per token0
+
+- start_tokens:
+
+  - token0_amount: token0 amount deposited (e.g., WETH)
+  - token1_amount: token1 amount deposited (e.g., USDT)
+  - token0_usd: USD value of token0 at start (requires ETHUSDT CSV)
+  - token1_usd: equals token1_amount (USDT is USD‑like)
+  - total_usd: token0_usd (0 if unavailable) + token1_usd
+
+- start_principal_tokens (excludes fees):
+
+  - token0_amount, token1_amount – principal holdings at start price
+  - token0_usd, token1_usd, total_usd – USD valuations (token0_usd requires ETHUSDT CSV)
+
+- end_tokens (includes accrued fees):
+
+  - token0_amount, token1_amount – end principal + fees
+  - token0_usd, token1_usd, total_usd – USD valuations at end price
+
+- end_principal_tokens (excludes fees):
+
+  - token0_amount, token1_amount – end principal only
+  - token0_usd, token1_usd, total_usd – USD valuations at end price
+
+- fees_usd: { token0, token1 } – fees valued in USD units
+
+- impermanent_loss:
+
+  - usd: difference between end_principal USD and HODL baseline USD at end price
+  - pct: usd / HODL baseline USD (negative means underperforming HODL)
+
+- valuation_baselines:
+  - hodl_end_usd: start principal tokens valued at end price (no rebalancing)
+  - end_principal_usd: actual end principal value (excludes fees)
+
+USD conversions:
+
+- Token1 (USDT) values are always in USD-equivalents.
+- Token0 (WETH) USD conversions require an ETHUSDT hourly CSV; if absent, token0 USDs are omitted while token1 USD totals remain.
 
 ### Recommendations
 

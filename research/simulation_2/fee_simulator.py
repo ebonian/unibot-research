@@ -591,6 +591,34 @@ def main():
     # Filter window
     t0 = pd.to_datetime(args.start, utc=True)
     t1 = pd.to_datetime(args.end, utc=True)
+
+    # Align initial pool state to on-chain state at or before t0
+    try:
+        # Prefer last swap strictly before t0 for price/tick
+        swaps_before = swaps[swaps['evt_block_time'] < t0]
+        if not swaps_before.empty:
+            prev = swaps_before.sort_values(['evt_block_time', 'evt_block_number']).iloc[-1]
+            init.sqrt_price_x96 = int(prev['sqrtPriceX96'])
+            init.tick = int(prev['tick'])
+        # Always (re)sample feeProtocol at/<= t0 from slot0 snapshots
+        slot0_df = pd.read_csv(base / 'dune_pipeline' / 'slot0_2025_09_01_to_2025_10_01_eth_usdt_0p3.csv')
+        if 'call_block_time' in slot0_df.columns:
+            slot0_df['call_block_time'] = pd.to_datetime(slot0_df['call_block_time'], utc=True)
+            slot0_at_or_before = slot0_df[slot0_df['call_block_time'] <= t0]
+            if not slot0_at_or_before.empty:
+                row = slot0_at_or_before.sort_values('call_block_time').iloc[-1]
+            else:
+                row = slot0_df.sort_values('call_block_time').iloc[0]
+            fee_proto0, fee_proto1 = decode_fee_protocol(int(row['output_feeProtocol']))
+            init.fee_protocol_token0 = fee_proto0
+            init.fee_protocol_token1 = fee_proto1
+            # If no swap before t0, use this snapshot for sqrtPrice/tick as a fallback
+            if swaps_before.empty:
+                init.sqrt_price_x96 = int(row['output_sqrtPriceX96'])
+                init.tick = int(row['output_tick'])
+    except Exception:
+        # If alignment fails for any reason, proceed with existing init
+        pass
     swaps_w = swaps[(swaps['evt_block_time'] >= t0) & (swaps['evt_block_time'] <= t1)].copy()
     swaps_w = swaps_w.sort_values(['evt_block_time', 'evt_block_number']).reset_index(drop=True)
     # Build initial tick map from events up to t0
@@ -759,6 +787,11 @@ def main():
     total_pnl_token1_units = end_value_total_token1_units - start_value_token1_units
     total_pnl_pct = (Decimal(0) if start_value_token1_units == 0 else (Decimal(total_pnl_token1_units) / Decimal(start_value_token1_units)))
 
+    # Impermanent loss in USD (token1 units) and percent
+    il_usd = float(Decimal(il_token1_units) / Decimal(10 ** cfg.decimals1))
+    hodl_end_value_usd = float(Decimal(hodl_end_value_token1_units) / Decimal(10 ** cfg.decimals1))
+    end_principal_value_usd = float(Decimal(end_value_principal_token1_units) / Decimal(10 ** cfg.decimals1))
+
     # If ETHUSDT prices are available, print ETH and USD conversions using hourly close
     def get_eth_usd_at(ts):
         if eth_usdt_df is None:
@@ -779,29 +812,76 @@ def main():
     end_tot0_eth = Decimal(end_principal0 + fees0) / Decimal(10 ** cfg.decimals0)
     end_tot1_usd = Decimal(end_principal1 + fees1) / Decimal(10 ** cfg.decimals1)
 
+    # Principal-only token units at start and end (exclude fees)
+    start_principal0_eth = Decimal(start_principal0) / Decimal(10 ** cfg.decimals0)
+    start_principal1_token1 = Decimal(start_principal1) / Decimal(10 ** cfg.decimals1)
+    end_principal0_eth_units = Decimal(end_principal0) / Decimal(10 ** cfg.decimals0)
+    end_principal1_token1 = Decimal(end_principal1) / Decimal(10 ** cfg.decimals1)
+
     deposit_token0_usd = float(dep0_eth * price_start_usd) if price_start_usd is not None else None
-    deposit_token1_usd = float(dep1_usd) if price_start_usd is not None else None
+    # token1 is USD-like (USDT); compute regardless of ETH price availability
+    deposit_token1_usd = float(dep1_usd)
     fees_token0_usd = float(fees0_eth * price_end_usd) if price_end_usd is not None else None
-    fees_token1_usd = float(fees1_usd) if price_end_usd is not None else None
+    fees_token1_usd = float(fees1_usd)
     end_token0_usd = float(end_tot0_eth * price_end_usd) if price_end_usd is not None else None
-    end_token1_usd = float(end_tot1_usd) if price_end_usd is not None else None
+    end_token1_usd = float(end_tot1_usd)
+
+    # Principal-only USD valuations
+    start_principal_token0_usd = float(start_principal0_eth * price_start_usd) if price_start_usd is not None else None
+    start_principal_token1_usd = float(start_principal1_token1)
+    end_principal_token0_usd = float(end_principal0_eth_units * price_end_usd) if price_end_usd is not None else None
+    end_principal_token1_usd = float(end_principal1_token1)
 
     summary = {
         'pool': cfg.pool,
         'fee_bps': cfg.fee,
-        'window_utc': {'start': t0.isoformat(), 'end': t1.isoformat()},
-        'pool_price_token1_per_token0': {
-            'start': float(start_price),
-            'end': float(end_price),
-        },
-        'position_ticks': {'lower': int(lower_tick), 'upper': int(upper_tick)},
         'tokens': {
             'token0': {'address': cfg.token0, 'symbol': cfg.symbol0, 'decimals': cfg.decimals0},
             'token1': {'address': cfg.token1, 'symbol': cfg.symbol1, 'decimals': cfg.decimals1},
         },
-        'deposit_usd': {'token0': deposit_token0_usd, 'token1': deposit_token1_usd},
+        'window_utc': {'start': t0.isoformat(), 'end': t1.isoformat()},
+        'position_ticks': {'lower': int(lower_tick), 'upper': int(upper_tick)},
+        'price': {
+            'start': float(start_price),
+            'end': float(end_price),
+        },
+        'start_tokens': {
+            'token0_amount': float(dep0_eth),
+            'token1_amount': float(dep1_usd),
+            'token0_usd': deposit_token0_usd,
+            'token1_usd': deposit_token1_usd,
+            'total_usd': (deposit_token0_usd if deposit_token0_usd is not None else 0.0) + deposit_token1_usd,
+        },
+        'start_principal_tokens': {
+            'token0_amount': float(start_principal0_eth),
+            'token1_amount': float(start_principal1_token1),
+            'token0_usd': start_principal_token0_usd,
+            'token1_usd': start_principal_token1_usd,
+            'total_usd': (start_principal_token0_usd if start_principal_token0_usd is not None else 0.0) + start_principal_token1_usd,
+        },
+        'end_tokens': {
+            'token0_amount': float(end_tot0_eth),
+            'token1_amount': float(end_tot1_usd),
+            'token0_usd': end_token0_usd,
+            'token1_usd': end_token1_usd,
+            'total_usd': (end_token0_usd if end_token0_usd is not None else 0.0) + end_token1_usd,
+        },
+        'end_principal_tokens': {
+            'token0_amount': float(end_principal0_eth_units),
+            'token1_amount': float(end_principal1_token1),
+            'token0_usd': end_principal_token0_usd,
+            'token1_usd': end_principal_token1_usd,
+            'total_usd': (end_principal_token0_usd if end_principal_token0_usd is not None else 0.0) + end_principal_token1_usd,
+        },
         'fees_usd': {'token0': fees_token0_usd, 'token1': fees_token1_usd},
-        'end_holdings_usd': {'token0': end_token0_usd, 'token1': end_token1_usd},
+        'impermanent_loss': {
+            'usd': il_usd,
+            'pct': float(il_pct),
+        },
+        'valuation_baselines': {
+            'hodl_end_usd': hodl_end_value_usd,
+            'end_principal_usd': end_principal_value_usd,
+        },
     }
     _json = json.dumps(summary, indent=4)
     # Replace 4 spaces with a tab for tab-indented output
