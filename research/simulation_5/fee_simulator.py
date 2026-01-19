@@ -934,6 +934,7 @@ class UniswapV3FeeSimulator:
 
         # Accumulators
         total_fees_earned_usd = 0.0
+        total_il_usd = 0.0  # accum realized IL
         total_rebalances = 0
         total_rebalance_cost_usd = 0.0
         position_history = [] # Initialize list to store range data for plotting
@@ -1039,6 +1040,7 @@ class UniswapV3FeeSimulator:
             # 4. Accumulate Fees and Check Rebalance Condition
             fees_usd = segment_result.fees_usd.token0 + segment_result.fees_usd.token1
             total_fees_earned_usd += fees_usd
+            total_il_usd += segment_result.impermanent_loss.usd
             
             price_at_end = segment_result.price.end
             
@@ -1057,7 +1059,11 @@ class UniswapV3FeeSimulator:
                 'end': current_t_end,
                 'price_lower': float(price_lower_px),
                 'price_upper': float(price_upper_px),
-                'rebalance': rebalance_needed_final
+                'rebalance': rebalance_needed_final,
+                'fees_usd': fees_usd,
+                'il_usd': segment_result.impermanent_loss.usd,
+                'price_start': segment_result.price.start,
+                'price_end': segment_result.price.end,
             })
             
             current_t_start = current_t_end
@@ -1072,11 +1078,13 @@ class UniswapV3FeeSimulator:
                 current_tick = price_to_tick(price_end_px_decimal, self.cfg.decimals0, self.cfg.decimals1)
                 
         # Final Result
+        # Net strategy gain = Fees + Realized IL (negative) - Gas Costs
         return {
             'total_fees_earned_usd': total_fees_earned_usd,
+            'total_il_usd': total_il_usd,
             'total_rebalances': total_rebalances,
             'total_rebalance_cost_usd': total_rebalance_cost_usd,
-            'net_strategy_gain_usd': total_fees_earned_usd - total_rebalance_cost_usd
+            'net_strategy_gain_usd': total_fees_earned_usd + total_il_usd - total_rebalance_cost_usd
         }, position_history # Return both the summary and the history
     
     # -----------------------------------------------------------
@@ -1112,6 +1120,7 @@ class UniswapV3FeeSimulator:
 
         # Accumulators
         total_fees_earned_usd = 0.0
+        total_il_usd = 0.0
         total_rebalances = 0
         total_rebalance_cost_usd = 0.0
         position_history = [] 
@@ -1202,6 +1211,7 @@ class UniswapV3FeeSimulator:
             # --- 4. Accumulate Fees and Update State ---
             fees_usd = segment_result.fees_usd.token0 + segment_result.fees_usd.token1
             total_fees_earned_usd += fees_usd
+            total_il_usd += segment_result.impermanent_loss.usd
             
             # Rebalance is MANDATORY at the end of the predictive window
             rebalance_needed_final = True if current_t_start < t_end_total else False
@@ -1227,7 +1237,8 @@ class UniswapV3FeeSimulator:
         # Final Result
         return {
             'total_fees_earned_usd': total_fees_earned_usd,
+            'total_il_usd': total_il_usd,
             'total_rebalances': total_rebalances,
             'total_rebalance_cost_usd': total_rebalance_cost_usd,
-            'net_strategy_gain_usd': total_fees_earned_usd - total_rebalance_cost_usd
+            'net_strategy_gain_usd': total_fees_earned_usd + total_il_usd - total_rebalance_cost_usd
         }, position_history

@@ -58,6 +58,8 @@ class UniswapV3ContinuousEnv(gym.Env):
         gas_per_action_usd: float = 0.1,  # Realistic L2 (Arbitrum) gas cost
         min_width_pct: float = 0.001,  # 0.1%
         max_width_pct: float = 0.01,   # 1%
+        mode: str = "train",  # "train" = first 80%, "eval" = last 20%, "all" = full data
+        train_ratio: float = 0.8,  # Fraction of data for training
     ):
         super().__init__()
 
@@ -85,18 +87,34 @@ class UniswapV3ContinuousEnv(gym.Env):
         self.gas_per_action_usd = float(gas_per_action_usd)
         self.min_width_pct = float(min_width_pct)
         self.max_width_pct = float(max_width_pct)
+        self.mode = mode
+        self.train_ratio = train_ratio
 
         # Build time windows from swaps
         t_min = pd.to_datetime(swaps["evt_block_time"].min(), utc=True)
         t_max = pd.to_datetime(swaps["evt_block_time"].max(), utc=True)
         starts = pd.date_range(start=t_min, end=t_max, freq=f"{self.window_hours}h", tz="UTC")
 
-        windows: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+        all_windows: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
         for s in starts[:-1]:
             e = s + pd.Timedelta(hours=self.window_hours)
             if e > t_max:
                 break
-            windows.append((s, e))
+            all_windows.append((s, e))
+
+        # Apply train/eval split
+        n_total = len(all_windows)
+        split_idx = int(n_total * train_ratio)
+        
+        if mode == "train":
+            windows = all_windows[:split_idx]
+            print(f"📊 TRAIN mode: using windows 0-{split_idx} ({len(windows)} windows)")
+        elif mode == "eval":
+            windows = all_windows[split_idx:]
+            print(f"📊 EVAL mode: using windows {split_idx}-{n_total} ({len(windows)} windows)")
+        else:  # "all"
+            windows = all_windows
+            print(f"📊 ALL mode: using all {len(windows)} windows")
 
         self.windows = windows
         self.n_windows = len(windows)
@@ -105,11 +123,11 @@ class UniswapV3ContinuousEnv(gym.Env):
         self.swaps_df = swaps.copy()
         self.swaps_df['evt_block_time'] = pd.to_datetime(self.swaps_df['evt_block_time'], utc=True)
         
-        # Gym spaces - EXPANDED observation
-        # obs: [log_price, width_pct, has_lp, volatility_24h, price_change_pct, in_range_flag]
+        # Gym spaces - EXPANDED observation (7 dimensions with capital)
+        # obs: [log_price, width_pct, has_lp, volatility_24h, price_change_pct, in_range_flag, capital_ratio]
         self.observation_space = spaces.Box(
-            low=np.array([-np.inf, 0.0, 0.0, 0.0, -1.0, 0.0], dtype=np.float32),
-            high=np.array([np.inf, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            low=np.array([-np.inf, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([np.inf, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0], dtype=np.float32),
         )
 
         # action: [mode, width_param] in [-1, 1]
@@ -126,6 +144,15 @@ class UniswapV3ContinuousEnv(gym.Env):
         self.current_upper = None
         self.current_width_pct = 0.0
         self.prev_price = None  # Track previous price for change calculation
+        
+        # Realistic IL tracking: only crystallize on rebalance/burn
+        self.position_entry_time = None      # When LP was minted
+        self.position_entry_price = None     # Price at entry
+        self.accumulated_fees = 0.0          # Fees earned since entry (unrealized)
+        
+        # Capital carry-over: track actual portfolio value
+        self.initial_capital = float(total_usd)  # Starting capital for reference
+        self.current_capital = float(total_usd)  # Actual portfolio value (changes with IL/fees)
 
     # ---------- helpers ----------
 
@@ -164,8 +191,8 @@ class UniswapV3ContinuousEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         if self.idx >= self.n_windows:
-            # Terminal - return 6 zeros
-            return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            # Terminal - return 7 zeros
+            return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
         t0, _ = self.windows[self.idx]
         price = self._get_price_at(t0)
@@ -188,6 +215,9 @@ class UniswapV3ContinuousEnv(gym.Env):
         else:
             in_range = 0.0
 
+        # Capital ratio: current_capital / initial_capital (capped at 2.0 for obs space)
+        capital_ratio = min(self.current_capital / self.initial_capital, 2.0) if self.initial_capital > 0 else 1.0
+
         obs = np.array([
             log_price,           # [0] Current log price
             self.current_width_pct,  # [1] Current width (0-1)
@@ -195,6 +225,7 @@ class UniswapV3ContinuousEnv(gym.Env):
             volatility,          # [3] 24h volatility (0-1)
             price_change_pct,    # [4] Price change since last step (-1 to 1)
             in_range,            # [5] Is current price in LP range
+            capital_ratio,       # [6] Current capital / initial capital (0-2)
         ], dtype=np.float32)
         return obs
 
@@ -223,6 +254,14 @@ class UniswapV3ContinuousEnv(gym.Env):
         self.current_upper = None
         self.current_width_pct = 0.0
         self.prev_price = None  # Reset previous price
+        
+        # Reset realistic IL tracking
+        self.position_entry_time = None
+        self.position_entry_price = None
+        self.accumulated_fees = 0.0
+        
+        # Reset capital to initial value
+        self.current_capital = self.initial_capital
 
         obs = self._get_obs()
         info = {}
@@ -249,67 +288,140 @@ class UniswapV3ContinuousEnv(gym.Env):
         adjust_threshold = 1.0 / 3.0
 
         if mode < burn_threshold:
-            # BURN / NO LP
-            if self.has_lp:
-                reward -= self.gas_per_action_usd  # pay gas to exit
+            # BURN / NO LP - Crystallize IL + accumulated fees
+            if self.has_lp and self.position_entry_time is not None:
+                # Calculate crystallized IL from entry to now
+                try:
+                    crystallize_summary = self.sim.simulate(
+                        price_lower=self.current_lower,
+                        price_upper=self.current_upper,
+                        start=self.position_entry_time.isoformat(),
+                        end=t0.isoformat(),
+                        liquidity=None,
+                        total_usd=self.current_capital,  # Use current capital
+                        validate=False,
+                        use_swap_liquidity=False,
+                        accounting_mode="growth",
+                        protocol_fee_encoding="base256",
+                    )
+                    crystallized_il = crystallize_summary.impermanent_loss.usd
+                except Exception:
+                    # Fallback if simulation fails (e.g., time range issues)
+                    crystallized_il = 0.0
+                
+                # Update capital: add fees and IL (IL is negative for losses)
+                capital_change = self.accumulated_fees + crystallized_il - self.gas_per_action_usd
+                self.current_capital += capital_change
+                self.current_capital = max(0.0, self.current_capital)  # Can't go negative
+                
+                # Reward = capital change
+                reward = float(capital_change)
+            elif self.has_lp:
+                # Had LP but no entry time (shouldn't happen, but handle gracefully)
+                capital_change = self.accumulated_fees - self.gas_per_action_usd
+                self.current_capital += capital_change
+                self.current_capital = max(0.0, self.current_capital)
+                reward = float(capital_change)
+            
+            # Reset position state
             self.has_lp = False
             self.current_lower = None
             self.current_upper = None
             self.current_width_pct = 0.0
+            self.position_entry_time = None
+            self.position_entry_price = None
+            self.accumulated_fees = 0.0
 
         elif mode <= adjust_threshold:
-            # HOLD
+            # HOLD - Only count fees, IL is unrealized (paper loss)
             if self.has_lp and self.current_lower is not None and self.current_upper is not None:
-                # simulate with existing range
+                # Simulate this window to get fees
                 summary = self.sim.simulate(
                     price_lower=self.current_lower,
                     price_upper=self.current_upper,
                     start=t0.isoformat(),
                     end=t1.isoformat(),
                     liquidity=None,
-                    total_usd=self.total_usd,
+                    total_usd=self.current_capital,  # Use current capital
                     validate=False,
                     use_swap_liquidity=False,
                     accounting_mode="growth",
                     protocol_fee_encoding="base256",
                 )
                 fees_usd = summary.fees_usd.token1
-                il_usd = summary.impermanent_loss.usd
-                # Note: simulator returns negative IL for losses, so we ADD it
-                reward += float(fees_usd + il_usd)
+                
+                # REALISTIC: Only count fees, IL is unrealized
+                self.accumulated_fees += float(fees_usd)
+                reward = float(fees_usd)  # Immediate reward is just fees
             else:
                 # no LP -> nothing happens
                 pass
 
         else:
-            # ADJUST: place / move LP in a new range around current price
+            # ADJUST: Crystallize old position IL + accumulated fees, open new position
             width_pct = self._width_from_action(a_width)
             lower = price_t0 * (1.0 - width_pct)
             upper = price_t0 * (1.0 + width_pct)
-
+            
+            # First: If we had an existing position, crystallize it
+            if self.has_lp and self.position_entry_time is not None:
+                try:
+                    crystallize_summary = self.sim.simulate(
+                        price_lower=self.current_lower,
+                        price_upper=self.current_upper,
+                        start=self.position_entry_time.isoformat(),
+                        end=t0.isoformat(),
+                        liquidity=None,
+                        total_usd=self.current_capital,  # Use current capital
+                        validate=False,
+                        use_swap_liquidity=False,
+                        accounting_mode="growth",
+                        protocol_fee_encoding="base256",
+                    )
+                    crystallized_il = crystallize_summary.impermanent_loss.usd
+                except Exception:
+                    crystallized_il = 0.0
+                
+                # Update capital and reward from closing old position
+                capital_change = self.accumulated_fees + crystallized_il - self.gas_per_action_usd
+                self.current_capital += capital_change
+                self.current_capital = max(0.0, self.current_capital)
+                reward += float(capital_change)
+            elif self.has_lp:
+                # Had LP but no entry time
+                capital_change = self.accumulated_fees - self.gas_per_action_usd
+                self.current_capital += capital_change
+                self.current_capital = max(0.0, self.current_capital)
+                reward += float(capital_change)
+            else:
+                # First time opening LP, just pay gas
+                self.current_capital -= self.gas_per_action_usd
+                self.current_capital = max(0.0, self.current_capital)
+                reward -= self.gas_per_action_usd
+            
+            # Now simulate this window for the NEW position to get initial fees
             summary = self.sim.simulate(
                 price_lower=lower,
                 price_upper=upper,
                 start=t0.isoformat(),
                 end=t1.isoformat(),
                 liquidity=None,
-                total_usd=self.total_usd,
+                total_usd=self.current_capital,  # Use updated capital
                 validate=False,
                 use_swap_liquidity=False,
                 accounting_mode="growth",
                 protocol_fee_encoding="base256",
             )
             fees_usd = summary.fees_usd.token1
-            il_usd = summary.impermanent_loss.usd
-            # Note: simulator returns negative IL for losses, so we ADD it
-            reward += float(fees_usd + il_usd - self.gas_per_action_usd)
 
-            # Update position state
+            # Update position state - new position starts NOW
             self.has_lp = True
             self.current_lower = lower
             self.current_upper = upper
-            # normalize width_pct to [0,1] for observation (relative to max_width_pct)
             self.current_width_pct = min(width_pct / self.max_width_pct, 1.0)
+            self.position_entry_time = t0
+            self.position_entry_price = price_t0
+            self.accumulated_fees = float(fees_usd)  # Start accumulating from this window
 
         # Move to next window
         self.idx += 1
@@ -317,7 +429,16 @@ class UniswapV3ContinuousEnv(gym.Env):
         terminated = self.idx >= self.n_windows
         truncated = False
         obs = self._get_obs()
-        info = {"t0": t0, "t1": t1, "price_t0": price_t0}
+        info = {
+            "t0": t0, 
+            "t1": t1, 
+            "price_t0": price_t0, 
+            "accumulated_fees": self.accumulated_fees, 
+            "current_capital": self.current_capital,
+            "current_lower": self.current_lower,
+            "current_upper": self.current_upper,
+            "has_lp": self.has_lp,
+        }
 
         return obs, reward, terminated, truncated, info
 
@@ -329,6 +450,7 @@ def make_env_fn(
     gas_per_action_usd: float,
     min_width_pct: float = 0.001,  # 0.1%
     max_width_pct: float = 0.01,   # 1%
+    mode: str = "train",  # "train", "eval", or "all"
 ):
     def _init():
         return UniswapV3ContinuousEnv(
@@ -338,6 +460,7 @@ def make_env_fn(
             gas_per_action_usd=gas_per_action_usd,
             min_width_pct=min_width_pct,
             max_width_pct=max_width_pct,
+            mode=mode,
         )
     return _init
 
