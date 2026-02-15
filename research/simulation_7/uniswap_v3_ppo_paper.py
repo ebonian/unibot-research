@@ -68,6 +68,10 @@ class HourlyData:
     decimals1: int
     pool_fee: float  # δ in paper (e.g. 0.003 for 0.3%)
     tick_spacing: int
+    # Total variation of sqrt(price) per hour, computed from swap-level data.
+    # Used for path-accurate fee calculation: fee = (δ/(1-δ)) * L_in_range * TV
+    # Following Zhang et al. (2023) who sum the fee formula over all swaps per hour.
+    tv_sqrt_price: Optional[Dict[pd.Timestamp, float]] = None
 
 
 def prepare_hourly_data(data_dir: str) -> HourlyData:
@@ -112,6 +116,19 @@ def prepare_hourly_data(data_dir: str) -> HourlyData:
     )
     swaps['volume_usd'] = swaps['amount1'].abs() / (10 ** decimals1)
     
+    # Compute total variation of sqrt(price) per hour from swap-level data.
+    # This captures the full price path within each hour for accurate fee calculation.
+    # Following Zhang et al. (2023): fees are summed over all swaps, not just open-close.
+    swaps['sqrt_price'] = np.sqrt(swaps['price'])
+    swaps_indexed_for_tv = swaps.set_index('evt_block_time')
+    tv_per_hour = {}
+    for hour, group in swaps_indexed_for_tv.groupby(pd.Grouper(freq='1h')):
+        if len(group) >= 2:
+            sp = group['sqrt_price'].values
+            tv_per_hour[hour] = float(np.sum(np.abs(np.diff(sp))))
+        else:
+            tv_per_hour[hour] = 0.0
+    
     # Resample to hourly OHLCV
     swaps.set_index('evt_block_time', inplace=True)
     hourly = swaps.resample('1h').agg({
@@ -152,6 +169,11 @@ def prepare_hourly_data(data_dir: str) -> HourlyData:
     ma_24h = hourly['ma_24h'].to_dict()
     ma_168h = hourly['ma_168h'].to_dict()
     
+    # Map TV values to the full (forward-filled) timestamp index
+    tv_sqrt_price = {}
+    for ts in timestamps:
+        tv_sqrt_price[ts] = tv_per_hour.get(ts, 0.0)
+    
     print("✅ Data preparation complete!")
     
     return HourlyData(
@@ -165,6 +187,7 @@ def prepare_hourly_data(data_dir: str) -> HourlyData:
         decimals1=decimals1,
         pool_fee=pool_fee,
         tick_spacing=tick_spacing,
+        tv_sqrt_price=tv_sqrt_price,
     )
 
 
@@ -318,37 +341,65 @@ class UniswapV3PaperEnv(gym.Env):
 
     def _compute_fee(self, price_t: float, price_t1: float, L: float, price_lower: float, price_upper: float) -> float:
         """
-        Compute trading fee from Equations 5-6 in paper.
+        Compute trading fee using path-accurate method following Zhang et al. (2023).
         
-        For price increase (p_t <= p_{t+1}):
-          f_t = (δ / (1-δ)) * L_t * (√p_{t+1} - √p_t)
+        The paper sums Equations 5-6 over all swaps within each hour.
+        We use the precomputed total variation of √price (TV) from swap-level data:
+            fee = (δ/(1-δ)) × L × TV(√price)_in_range
         
-        For price decrease (p_t > p_{t+1}):
-          f_t = (δ / (1-δ)) * L_t * (1/√p_{t+1} - 1/√p_t) * p_{t+1}
-        
-        Only earns fees when price is within LP range.
+        When price stays in the LP range for the whole hour, TV exactly equals the
+        sum of per-swap fees. When price is partially out of range, we scale TV by
+        the estimated fraction of the price path within the LP range.
         """
         if L <= 0:
             return 0.0
-        
-        delta = self.pool_fee
-        fee_multiplier = delta / (1.0 - delta)
-        
-        # Clamp prices to LP range for fee calculation
-        p_t_clamped = max(price_lower, min(price_upper, price_t))
-        p_t1_clamped = max(price_lower, min(price_upper, price_t1))
         
         # If both prices are outside range on same side, no fees
         if (price_t < price_lower and price_t1 < price_lower) or \
            (price_t > price_upper and price_t1 > price_upper):
             return 0.0
         
-        if p_t_clamped <= p_t1_clamped:
-            # Price increase: Equation 5
-            fee = fee_multiplier * L * (math.sqrt(p_t1_clamped) - math.sqrt(p_t_clamped))
+        delta = self.pool_fee
+        fee_multiplier = delta / (1.0 - delta)
+        
+        # Get precomputed total variation of sqrt(price) for this hour
+        t0 = self.timestamps[self.idx]
+        tv = self.hourly_data.tv_sqrt_price.get(t0, 0.0) if self.hourly_data.tv_sqrt_price else 0.0
+        
+        if tv > 0:
+            # Estimate in-range fraction of the price path
+            sqrt_pl = math.sqrt(price_lower)
+            sqrt_pu = math.sqrt(price_upper)
+            sqrt_p0 = math.sqrt(price_t)
+            sqrt_p1 = math.sqrt(price_t1)
+            sqrt_p0_c = max(sqrt_pl, min(sqrt_pu, sqrt_p0))
+            sqrt_p1_c = max(sqrt_pl, min(sqrt_pu, sqrt_p1))
+            
+            if price_t >= price_lower and price_t <= price_upper and price_t1 >= price_lower and price_t1 <= price_upper:
+                # Both endpoints in range → virtually all swaps are in range
+                in_range_frac = 1.0
+            else:
+                total_sqrt_move = abs(sqrt_p1 - sqrt_p0)
+                clamped_sqrt_move = abs(sqrt_p1_c - sqrt_p0_c)
+                if total_sqrt_move > 1e-10:
+                    in_range_frac = min(1.0, clamped_sqrt_move / total_sqrt_move)
+                else:
+                    mid_price = (price_t + price_t1) / 2
+                    if price_lower <= mid_price <= price_upper:
+                        in_range_frac = 0.5
+                    else:
+                        in_range_frac = 0.0
+            
+            fee = fee_multiplier * L * tv * in_range_frac
         else:
-            # Price decrease: Equation 6
-            fee = fee_multiplier * L * (1.0 / math.sqrt(p_t1_clamped) - 1.0 / math.sqrt(p_t_clamped)) * p_t1_clamped
+            # Fallback to open-close formula if no TV data available
+            p_t_clamped = max(price_lower, min(price_upper, price_t))
+            p_t1_clamped = max(price_lower, min(price_upper, price_t1))
+            
+            if p_t_clamped <= p_t1_clamped:
+                fee = fee_multiplier * L * (math.sqrt(p_t1_clamped) - math.sqrt(p_t_clamped))
+            else:
+                fee = fee_multiplier * L * (1.0 / math.sqrt(p_t1_clamped) - 1.0 / math.sqrt(p_t_clamped)) * p_t1_clamped
         
         return max(0.0, fee)
 

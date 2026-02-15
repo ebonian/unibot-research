@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints and outputs
+models/
+*.zip
+*.pkl
+*.pth
+checkpoints_paper/
+best_model_paper/
+eval_logs_paper/
+logs/
+
+# Visualizations (regenerable)
+visualizations/
+
+# Large data files (use from simulation_6)
+training_data/
+*.csv

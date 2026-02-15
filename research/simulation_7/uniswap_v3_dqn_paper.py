@@ -232,6 +232,10 @@ class HourlyDataExtended:
     decimals1: int
     pool_fee: float
     tick_spacing: int
+    # Total variation of sqrt(price) per hour, computed from swap-level data.
+    # Used for path-accurate fee calculation: fee = (δ/(1-δ)) * L_in_range * TV
+    # Following Zhang et al. (2023) who sum the fee formula over all swaps per hour.
+    tv_sqrt_price: Optional[Dict[pd.Timestamp, float]] = None
 
 
 def prepare_hourly_data_extended(data_dir: str) -> HourlyDataExtended:
@@ -275,6 +279,19 @@ def prepare_hourly_data_extended(data_dir: str) -> HourlyDataExtended:
         lambda x: sqrt_price_x96_to_price(int(x), decimals0, decimals1)
     )
     swaps['volume_usd'] = swaps['amount1'].abs() / (10 ** decimals1)
+    
+    # Compute total variation of sqrt(price) per hour from swap-level data.
+    # This captures the full price path within each hour for accurate fee calculation.
+    # Following Zhang et al. (2023): fees are summed over all swaps, not just open-close.
+    swaps['sqrt_price'] = np.sqrt(swaps['price'])
+    swaps_indexed_for_tv = swaps.set_index('evt_block_time')
+    tv_per_hour = {}
+    for hour, group in swaps_indexed_for_tv.groupby(pd.Grouper(freq='1h')):
+        if len(group) >= 2:
+            sp = group['sqrt_price'].values
+            tv_per_hour[hour] = float(np.sum(np.abs(np.diff(sp))))
+        else:
+            tv_per_hour[hour] = 0.0
     
     # Resample to hourly OHLCV
     swaps.set_index('evt_block_time', inplace=True)
@@ -327,6 +344,11 @@ def prepare_hourly_data_extended(data_dir: str) -> HourlyDataExtended:
     prices = hourly['close'].to_dict()
     volumes = hourly['volume'].to_dict()
     
+    # Map TV values to the full (forward-filled) timestamp index
+    tv_sqrt_price = {}
+    for ts in timestamps:
+        tv_sqrt_price[ts] = tv_per_hour.get(ts, 0.0)
+    
     # Build feature vectors
     features = {}
     for ts in timestamps:
@@ -346,6 +368,7 @@ def prepare_hourly_data_extended(data_dir: str) -> HourlyDataExtended:
         decimals1=decimals1,
         pool_fee=pool_fee,
         tick_spacing=tick_spacing,
+        tv_sqrt_price=tv_sqrt_price,
     )
 
 
@@ -733,8 +756,15 @@ class UniswapV3DQNEnv(gym.Env):
 
     def _compute_fee(self, price_t0: float, price_t1: float) -> float:
         """
-        Compute trading fee using paper formula (Equation 3).
-        fee = (δ/(1-δ)) × L × (√p' - √p)  [if p ≤ p']
+        Compute trading fee using path-accurate method following Zhang et al. (2023).
+        
+        The paper sums the fee formula (Equation 3) over all swaps within each hour.
+        We use the precomputed total variation of √price (TV) from swap-level data:
+            fee = (δ/(1-δ)) × L × TV(√price)_in_range
+        
+        When price stays in the LP range for the whole hour, TV exactly equals the
+        sum of per-swap fees. When price is partially out of range, we scale TV by
+        the fraction of the price path that falls within the LP range.
         """
         if not self.has_position or self.liquidity <= 0:
             return 0.0
@@ -743,10 +773,6 @@ class UniswapV3DQNEnv(gym.Env):
         upper_tick = self.position_center_tick + self.position_width * self.tick_spacing
         p_lower = tick_to_price(lower_tick)
         p_upper = tick_to_price(upper_tick)
-        
-        # Clamp prices to position range
-        p0_clamped = max(p_lower, min(p_upper, price_t0))
-        p1_clamped = max(p_lower, min(p_upper, price_t1))
         
         # No fees if both prices outside range on same side
         if (price_t0 < p_lower and price_t1 < p_lower) or \
@@ -757,12 +783,58 @@ class UniswapV3DQNEnv(gym.Env):
         fee_mult = delta / (1.0 - delta)
         L = self.liquidity
         
-        if p0_clamped <= p1_clamped:
-            # Price increase
-            fee = fee_mult * L * (math.sqrt(p1_clamped) - math.sqrt(p0_clamped))
+        # Get precomputed total variation of sqrt(price) for this hour
+        t0 = self.timestamps[self.idx]
+        tv = self.hourly_data.tv_sqrt_price.get(t0, 0.0) if self.hourly_data.tv_sqrt_price else 0.0
+        
+        if tv > 0:
+            # Scale TV by the fraction of the price path within LP range.
+            # If both endpoints are in range, most of the path is in range → scale ≈ 1.
+            # If one or both endpoints are out of range, reduce proportionally.
+            sqrt_pl = math.sqrt(p_lower)
+            sqrt_pu = math.sqrt(p_upper)
+            range_width = sqrt_pu - sqrt_pl
+            
+            # Estimate in-range fraction: what fraction of the total √price movement 
+            # overlaps with [√p_lower, √p_upper]
+            sqrt_p0 = math.sqrt(price_t0)
+            sqrt_p1 = math.sqrt(price_t1)
+            
+            # If price path spans beyond LP range, the out-of-range portion earns no fees
+            # Use clamped endpoints to estimate the in-range fraction
+            sqrt_p0_c = max(sqrt_pl, min(sqrt_pu, sqrt_p0))
+            sqrt_p1_c = max(sqrt_pl, min(sqrt_pu, sqrt_p1))
+            
+            # For well-positioned LPs (both prices in range), in_range_frac ≈ 1.0
+            # For out-of-range, the clamped net movement is 0, but some path may still cross
+            if price_t0 >= p_lower and price_t0 <= p_upper and price_t1 >= p_lower and price_t1 <= p_upper:
+                # Both endpoints in range → virtually all swaps are in range
+                in_range_frac = 1.0
+            else:
+                # Partial: estimate fraction based on how much of the open-close move is in range
+                total_sqrt_move = abs(sqrt_p1 - sqrt_p0)
+                clamped_sqrt_move = abs(sqrt_p1_c - sqrt_p0_c)
+                if total_sqrt_move > 1e-10:
+                    in_range_frac = min(1.0, clamped_sqrt_move / total_sqrt_move)
+                else:
+                    # Price barely moved but TV may be nonzero (zigzag)
+                    # Use range coverage: if price is near range, likely most swaps in range
+                    mid_price = (price_t0 + price_t1) / 2
+                    if p_lower <= mid_price <= p_upper:
+                        in_range_frac = 0.5  # Conservative estimate
+                    else:
+                        in_range_frac = 0.0
+            
+            fee = fee_mult * L * tv * in_range_frac
         else:
-            # Price decrease
-            fee = fee_mult * L * (1.0/math.sqrt(p1_clamped) - 1.0/math.sqrt(p0_clamped)) * p1_clamped
+            # Fallback to open-close formula if no TV data available
+            p0_clamped = max(p_lower, min(p_upper, price_t0))
+            p1_clamped = max(p_lower, min(p_upper, price_t1))
+            
+            if p0_clamped <= p1_clamped:
+                fee = fee_mult * L * (math.sqrt(p1_clamped) - math.sqrt(p0_clamped))
+            else:
+                fee = fee_mult * L * (1.0/math.sqrt(p1_clamped) - 1.0/math.sqrt(p0_clamped)) * p1_clamped
         
         return max(0.0, fee)
 
@@ -1301,7 +1373,7 @@ def train_lstm_dqn(
         device=device,
     )
     
-    print("🏃 Starting LSTM training...")
+    print("🏃 Starting LSTM training...", flush=True)
     print("=" * 60)
     
     best_eval_reward = -float('inf')
@@ -1347,12 +1419,12 @@ def train_lstm_dqn(
         # Logging
         if (episode + 1) % 10 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
-            print(f"  Episode {episode+1}/{n_episodes} | Avg Reward: {avg_reward:.2f} | Epsilon: {agent.epsilon:.3f}")
+            print(f"  Episode {episode+1}/{n_episodes} | Avg Reward: {avg_reward:.2f} | Epsilon: {agent.epsilon:.3f}", flush=True)
         
         # Evaluation
         if (episode + 1) % eval_freq == 0:
             eval_reward = evaluate_lstm_agent(agent, eval_env, n_episodes=5)
-            print(f"  [EVAL] Episode {episode+1} | Eval Reward: {eval_reward:.2f}")
+            print(f"  [EVAL] Episode {episode+1} | Eval Reward: {eval_reward:.2f}", flush=True)
             
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
@@ -1475,12 +1547,12 @@ def train_dqn(
         # Logging
         if (episode + 1) % 10 == 0:
             avg_reward = np.mean(episode_rewards[-10:])
-            print(f"  Episode {episode+1}/{n_episodes} | Avg Reward: {avg_reward:.2f} | Epsilon: {agent.epsilon:.3f}")
+            print(f"  Episode {episode+1}/{n_episodes} | Avg Reward: {avg_reward:.2f} | Epsilon: {agent.epsilon:.3f}", flush=True)
         
         # Evaluation
         if (episode + 1) % eval_freq == 0:
             eval_reward = evaluate_agent(agent, eval_env, n_episodes=5)
-            print(f"  [EVAL] Episode {episode+1} | Eval Reward: {eval_reward:.2f}")
+            print(f"  [EVAL] Episode {episode+1} | Eval Reward: {eval_reward:.2f}", flush=True)
             
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
