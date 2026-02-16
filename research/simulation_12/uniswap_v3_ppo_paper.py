@@ -861,6 +861,7 @@ def evaluate_paper_method(
     vec_normalize_path: Optional[str] = None,
     n_episodes: int = 10,
     action_ticks: List[int] = [0, 1, 3, 5, 10, 20, 40],
+    initial_capital_usd: float = 1000.0,
 ) -> dict:
     """
     Evaluate trained model on test set.
@@ -881,7 +882,7 @@ def evaluate_paper_method(
     except ImportError:
         hourly_data = prepare_hourly_data(data_dir)
     
-    eval_fn = make_env_fn(hourly_data, action_ticks=action_ticks, mode="test")
+    eval_fn = make_env_fn(hourly_data, action_ticks=action_ticks, initial_capital_usd=initial_capital_usd, mode="test")
     env = DummyVecEnv([eval_fn])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
     if os.path.exists(vec_normalize_path):

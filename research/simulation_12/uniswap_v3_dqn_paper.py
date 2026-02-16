@@ -1672,6 +1672,7 @@ def evaluate_on_test(
     model_path: str = "dqn_uniswap_v3_paper_best.pth",
     n_episodes: int = 10,
     device: str = "cpu",
+    initial_capital_usd: float = 1000.0,
 ) -> dict:
     """Evaluate trained model on test set."""
     print("=" * 60)
@@ -1679,7 +1680,7 @@ def evaluate_on_test(
     print("=" * 60)
     
     hourly_data = prepare_hourly_data_extended(data_dir)
-    test_env = UniswapV3DQNEnv(hourly_data, mode="test")
+    test_env = UniswapV3DQNEnv(hourly_data, initial_capital_usd=initial_capital_usd, mode="test")
     
     agent = DuelingDDQNAgent(
         state_dim=test_env.state_dim,

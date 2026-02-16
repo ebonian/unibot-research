@@ -477,7 +477,7 @@ def visualize_dqn_decisions(data_dir: str, model_path: str, device: str = "cpu",
 
 
 def visualize_lstm_decisions(data_dir: str, model_path: str = "models/comparison_lstm_dqn_best.pth", 
-                              seq_len: int = 24, device: str = "cpu"):
+                              seq_len: int = 24, device: str = "cpu", initial_capital: float = 1000.0):
     """Visualize LSTM DQN agent decisions on test set."""
     print("\n" + "=" * 60)
     print("📊 Visualizing LSTM DQN Decisions on Test Set")
@@ -486,7 +486,7 @@ def visualize_lstm_decisions(data_dir: str, model_path: str = "models/comparison
     from uniswap_v3_dqn_paper import prepare_hourly_data_extended, UniswapV3DQNEnv, LSTMDDQNAgent, tick_to_price
     
     hourly_data = prepare_hourly_data_extended(data_dir)
-    env = UniswapV3DQNEnv(hourly_data, mode="test")
+    env = UniswapV3DQNEnv(hourly_data, initial_capital_usd=initial_capital, mode="test")
     
     agent = LSTMDDQNAgent(
         state_dim=env.state_dim,
@@ -720,8 +720,8 @@ def plot_decisions(ppo_data: Dict, dqn_data: Dict, save_path: str = "visualizati
     return save_path
 
 
-def plot_all_models(ppo_data: Dict, dqn_data: Dict, lstm_data: Dict, save_path: str, run_name: str = ""):
-    """Plot all three models (PPO, DQN, LSTM) in one figure with cumulative rewards comparison."""
+def plot_all_models(ppo_data: Dict, dqn_data: Dict, lstm_data: Dict, save_path: str, run_name: str = "", initial_capital: float = 100.0):
+    """Plot all three models (PPO, DQN, LSTM) in one figure with portfolio value comparison."""
     from matplotlib.patches import Patch
     from matplotlib.lines import Line2D
 
@@ -746,15 +746,22 @@ def plot_all_models(ppo_data: Dict, dqn_data: Dict, lstm_data: Dict, save_path: 
     _add_panel(axes[1], dqn_data, 'orange', f'DQN {run_name} ({n_dqn_h} HOLDs)')
     _add_panel(axes[2], lstm_data, 'purple', f'LSTM DQN {run_name} ({n_lstm_h} HOLDs)')
 
-    axes[3].plot(timestamps, ppo_data["cumulative_rewards"], 'g-', linewidth=2, label=f'PPO ({ppo_data["cumulative_rewards"][-1]:.0f})')
-    axes[3].plot(timestamps, dqn_data["cumulative_rewards"], color='orange', linewidth=2, label=f'DQN ({dqn_data["cumulative_rewards"][-1]:.0f})')
-    axes[3].plot(timestamps, lstm_data["cumulative_rewards"], 'purple', linewidth=2, label=f'LSTM ({lstm_data["cumulative_rewards"][-1]:.0f})')
-    axes[3].axhline(y=0, color='k', linestyle='--', alpha=0.5)
-    axes[3].set_ylabel('Cumulative Reward ($)', fontsize=10)
+    # Plot PnL = cumulative_reward scaled to initial_capital 
+    # (Assuming cumulative_reard is normalized return, PnL = initial * cumulative_reward)
+    # correction: previous step showed we were just adding it.
+    # Actually, let's look at how we compute it. 
+    # The cumulative_rewards in the data are raw sum of rewards.
+    # If reward is fee+LVR, then cumulative reward IS the PnL in dollars for that trajectory.
+    
+    axes[3].plot(timestamps, ppo_data["cumulative_rewards"], 'g-', linewidth=2, label=f'PPO (${ppo_data["cumulative_rewards"][-1]:.2f})')
+    axes[3].plot(timestamps, dqn_data["cumulative_rewards"], color='orange', linewidth=2, label=f'DQN (${dqn_data["cumulative_rewards"][-1]:.2f})')
+    axes[3].plot(timestamps, lstm_data["cumulative_rewards"], 'purple', linewidth=2, label=f'LSTM (${lstm_data["cumulative_rewards"][-1]:.2f})')
+    axes[3].axhline(y=0, color='k', linestyle='--', alpha=0.5, label='Break-even ($0)')
+    axes[3].set_ylabel(f'PnL ($)', fontsize=10)
     axes[3].set_xlabel('Date', fontsize=10)
     axes[3].legend(loc='lower left')
     axes[3].grid(True, alpha=0.3)
-    axes[3].set_title('Cumulative Rewards', fontsize=11, fontweight='bold')
+    axes[3].set_title(f'Accumulated PnL (Initial Investment: ${initial_capital:.0f})', fontsize=11, fontweight='bold')
     for ax in axes:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
     plt.xticks(rotation=45)
@@ -838,13 +845,17 @@ def format_action_distribution_human(ad: dict, total_steps: int) -> str:
     return "\n".join(lines) if lines else "  (no actions)"
 
 
-def compute_pnl_custom(trajectory_data: dict, target_initial_capital: float = 1000.0) -> dict:
+def compute_pnl_custom(trajectory_data: dict, target_initial_capital: float = 1000.0, simulated_capital: float = None) -> dict:
     """
     From trajectory (one episode): cumulative reward is USD PnL for position in env.
-    Scale to "if we invested $target_initial_capital at test start, what would we have at end?"
-    initial_cap_usd = 2 * price[0] (2 ETH in USD at first step).
-    return = cumulative_reward / initial_cap_usd.
-    end_value_custom = target_initial_capital * (1 + return) = target_initial_capital + PnL on target.
+    
+    simulated_capital = the capital actually used in the simulation env.
+    If provided, return_pct = cumulative_reward / simulated_capital.
+    Otherwise fallback to old heuristic: 2 * price[0].
+    
+    Then scale to target_initial_capital:
+      pnl_custom = target_initial_capital * return_pct
+      end_value  = target_initial_capital + pnl_custom
     """
     out = {}
     for name, data in trajectory_data.items():
@@ -854,7 +865,10 @@ def compute_pnl_custom(trajectory_data: dict, target_initial_capital: float = 10
         cum = data["cumulative_rewards"]
         if not prices or not cum:
             continue
-        initial_cap_usd = 2.0 * float(prices[0])  # 2 ETH at start
+        if simulated_capital is not None:
+            initial_cap_usd = simulated_capital
+        else:
+            initial_cap_usd = 2.0 * float(prices[0])  # fallback: 2 ETH
         cumulative_reward = float(cum[-1])
         return_pct = cumulative_reward / initial_cap_usd if initial_cap_usd > 0 else 0.0
         pnl_custom = target_initial_capital * return_pct
@@ -1003,7 +1017,7 @@ def generate_run_config(run_dir: str, args, results: dict, trajectory_data: dict
     # PnL for custom capital invested: plotted trajectory + mean over 10 episodes
     target_cap = args.initial_capital
     if trajectory_data:
-        pnl = compute_pnl_custom(trajectory_data, target_initial_capital=target_cap)
+        pnl = compute_pnl_custom(trajectory_data, target_initial_capital=target_cap, simulated_capital=target_cap)
         if pnl:
             initial_cap_env = list(pnl.values())[0]["initial_cap_usd"]
             config += f"\n## PnL: ${target_cap:.0f} invested at test start\n\n"
@@ -1183,8 +1197,8 @@ def main():
             if not os.path.exists(model_path):
                 model_path = f"{models_dir}/comparison_dqn_final.pth"
             
-            ppo_data = visualize_ppo_decisions(args.data_dir, f"{models_dir}/comparison_ppo.zip")
-            dqn_data = visualize_dqn_decisions(args.data_dir, model_path, args.device)
+            ppo_data = visualize_ppo_decisions(args.data_dir, f"{models_dir}/comparison_ppo.zip", initial_capital=args.initial_capital)
+            dqn_data = visualize_dqn_decisions(args.data_dir, model_path, args.device, initial_capital=args.initial_capital)
             plot_path = plot_decisions(ppo_data, dqn_data, f"{viz_dir}/test_decisions.png")
             print(f"\n  PPO+DQN saved to: {plot_path}", flush=True)
         except Exception as e:
@@ -1197,7 +1211,8 @@ def main():
                 
             lstm_data = visualize_lstm_decisions(
                 args.data_dir, model_path,
-                args.lstm_seq_len, args.device
+                args.lstm_seq_len, args.device,
+                initial_capital=args.initial_capital
             )
             lstm_plot_path = plot_lstm_decisions(lstm_data, f"{viz_dir}/test_lstm_decisions.png")
             print(f"  LSTM saved to: {lstm_plot_path}", flush=True)
@@ -1206,7 +1221,7 @@ def main():
         
         if ppo_data and dqn_data and lstm_data:
             try:
-                plot_all_models(ppo_data, dqn_data, lstm_data, f"{viz_dir}/test_all_models.png", run_name=run_dir)
+                plot_all_models(ppo_data, dqn_data, lstm_data, f"{viz_dir}/test_all_models.png", run_name=run_dir, initial_capital=args.initial_capital)
             except Exception as e:
                 print(f"  All-models plot failed: {e}", flush=True)
         
@@ -1222,7 +1237,7 @@ def main():
         # PnL for custom capital invested (plotted trajectory + mean over 10 ep)
         target_cap = args.initial_capital
         trajectory_data = {"ppo": ppo_data, "dqn": dqn_data, "lstm_dqn": lstm_data}
-        pnl = compute_pnl_custom(trajectory_data, target_initial_capital=target_cap)
+        pnl = compute_pnl_custom(trajectory_data, target_initial_capital=target_cap, simulated_capital=target_cap)
         if pnl:
             initial_cap_env = list(pnl.values())[0]["initial_cap_usd"]
             print(f"\n  PnL if you invested ${target_cap:.0f} at test start:", flush=True)
