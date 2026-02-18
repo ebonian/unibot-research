@@ -37,6 +37,10 @@ from uniswap_v3_dqn_paper import (
 # ─── Constants ────────────────────────────────────────────────────────────────
 TICK_SPACING = 10
 POOL_FEE = 0.0005  # 0.05%
+DEC0, DEC1 = 18, 6  # WETH, USDT
+# Simulation uses tick = log(price_usd)/log(1.0001). On-chain uses tick = log(price_raw)/log(1.0001)
+# where price_raw = price_usd/10^12. So tick_onchain = tick_sim - TICK_OFFSET.
+TICK_OFFSET = int(round((DEC0 - DEC1) * math.log(10) / math.log(1.0001)))
 
 ACTIONS = {
     0: {"label": "HOLD",      "width": None, "range_pct": 0},
@@ -180,13 +184,18 @@ def build_observation(tech_features: np.ndarray,
 
 
 def get_lp_range(price: float, width: int) -> dict:
-    """Compute LP range around current price for given width."""
-    tick = price_to_tick(price)
-    center_tick = (tick // TICK_SPACING) * TICK_SPACING
+    """
+    Compute LP range around current price for given width.
+    Returns on-chain ticks (ready for Uniswap V3 mint/deploy).
+    """
+    tick_sim = price_to_tick(price)
+    center_tick_sim = (tick_sim // TICK_SPACING) * TICK_SPACING
+    # Convert to on-chain tick space (ETH/USDT: price_raw = price_usd/10^12)
+    center_tick = center_tick_sim - TICK_OFFSET
     lower_tick = center_tick - width * TICK_SPACING
     upper_tick = center_tick + width * TICK_SPACING
-    p_lower = tick_to_price(lower_tick)
-    p_upper = tick_to_price(upper_tick)
+    p_lower = tick_to_price(lower_tick + TICK_OFFSET)  # for display, use sim tick
+    p_upper = tick_to_price(upper_tick + TICK_OFFSET)
     return {
         "center_tick": center_tick,
         "lower_tick": lower_tick,

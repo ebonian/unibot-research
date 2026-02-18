@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SIM_DIR = os.path.join(SCRIPT_DIR, "..", "research", "simulation_12")
+SIM_DIR = os.path.join(SCRIPT_DIR, "research", "simulation_12")
 sys.path.insert(0, SIM_DIR)
 
 from uniswap_v3_dqn_paper import (
@@ -101,7 +101,7 @@ def compute_agent_L_onchain(capital_usd: float, price_usd: float,
 
 
 def run_fee_calculation(data_dir: str, swap_file: str, model_name: str,
-                        capital: float, device: str = "cpu"):
+                        capital: float, device: str = "cpu", mode: str = "test"):
     """
     Replay model decisions over test period and compute real fees per swap.
     """
@@ -109,11 +109,11 @@ def run_fee_calculation(data_dir: str, swap_file: str, model_name: str,
     print("📊 Loading hourly data...")
     hourly_data = prepare_hourly_data_extended(data_dir)
 
-    env = UniswapV3DQNEnv(hourly_data, initial_capital_usd=capital, mode="test")
+    env = UniswapV3DQNEnv(hourly_data, initial_capital_usd=capital, mode=mode)
     state_dim = env.state_dim
     action_dim = env.action_space.n
 
-    model_dir = os.path.join(SCRIPT_DIR, "models")
+    model_dir = os.path.join(SCRIPT_DIR, "kongtrae", "models")
 
     if model_name == "ppo":
         from stable_baselines3 import PPO
@@ -308,6 +308,9 @@ def run_fee_calculation(data_dir: str, swap_file: str, model_name: str,
         agent_fee = fee_usd * (agent_L / pool_L)
         total_agent_fee_usd += agent_fee
 
+        if swaps_in_range <= 5: 
+             print(f"   [Swap {swaps_in_range}] Tick: {swap_tick}, Range: [{lower_tick_onchain}, {upper_tick_onchain}], Pool L: {pool_L:.0f}, Agent L: {agent_L:.0f}, Share: {agent_L/pool_L*100:.8f}%, Fee: ${agent_fee:.6f}")
+
     # ── Results ──
     test_hours = len(hourly_decisions)
     test_days = test_hours / 24
@@ -358,11 +361,13 @@ def main():
                         help="Path to hourly data directory")
     parser.add_argument("--swap-file", default=None,
                         help="Path to raw swap CSV (auto-detected if not set)")
-    parser.add_argument("--model", default="dqn", choices=["ppo", "dqn", "lstm"],
-                        help="Model to replay")
+    parser.add_argument("--model", default="dqn",
+                        help="Model to replay (ppo, dqn, lstm, or fixed_width_N)")
     parser.add_argument("--capital", type=float, default=100.0,
                         help="Agent capital in USD")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--mode", default="test", choices=["train", "eval", "test", "full"],
+                        help="Data split to run on (test=last 10 percent, full=all data)")
 
     args = parser.parse_args()
 
@@ -374,7 +379,7 @@ def main():
         args.swap_file = files[0]
 
     run_fee_calculation(args.data_dir, args.swap_file, args.model,
-                       args.capital, args.device)
+                       args.capital, args.device, args.mode)
 
 
 if __name__ == "__main__":
